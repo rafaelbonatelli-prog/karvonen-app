@@ -27,9 +27,9 @@ pace_input = st.sidebar.text_input("Pace de Limiar (MM:SS)", value="4:40")
 st.sidebar.header("📊 Configurações do Gráfico")
 JANELA_SUAVIZACAO_SEG = st.sidebar.selectbox(
     "Suavização da Média Móvel (segundos)", 
-    options=[30, 60, 90, 120], 
-    index=1, # O padrão será 60 segundos
-    help="Janelas maiores ignoram picos curtos do GPS (melhor para longos). Janelas menores mostram dados mais crus (melhor para tiros curtos)."
+    options=[30, 45, 60, 90, 120], 
+    index=2, # Padrão 60s
+    help="Janelas maiores ignoram picos curtos do GPS. Janelas menores mostram dados crus."
 )
 
 try:
@@ -41,6 +41,8 @@ except:
 
 VELOCIDADE_LIMIAR_MS = 1000 / (PACE_LIMIAR_MIN_KM * 60)
 FC_RESERVA_RANGE = fc_limiar - fc_repouso
+CUTOFF_SPEED_MS = 3.2 # Velocidade para considerar tiro (Aprox. 5:12/km)
+STEADY_STATE_TRIM_S = 45 # Atraso cardíaco ignorado no tiro
 
 # --- UPLOAD DE MÚLTIPLOS ARQUIVOS ---
 arquivos_tcx = st.file_uploader("Selecione um ou mais treinos (.tcx)", type=['tcx'], accept_multiple_files=True)
@@ -52,6 +54,7 @@ if arquivos_tcx:
         
         for arquivo in arquivos_tcx:
             try:
+                arquivo.seek(0) # Rebobina o arquivo para evitar tela em branco nos recarregamentos
                 data = []
                 tree = ET.parse(arquivo)
                 root = tree.getroot()
@@ -86,7 +89,26 @@ if arquivos_tcx:
                 df['pct_velocidade_threshold'] = df['velocidade_suave'] / VELOCIDADE_LIMIAR_MS
                 df['idx_karvonen'] = df['pct_velocidade_threshold'] - df['pct_fc_reserva']
                 
-                # Resumo para a tabela
+                # --- AUTO-LAP E TIROS ---
+                df['is_quality_raw'] = df['velocidade_suave'] > CUTOFF_SPEED_MS
+                df['block_change'] = df['is_quality_raw'].ne(df['is_quality_raw'].shift()).cumsum()
+                df['block_duration'] = df.groupby('block_change')['elapsed_time'].transform(lambda x: x - x.min())
+                
+                quality_blocks = df[df['is_quality_raw']].groupby('block_change')
+                splits = []
+                block_num = 1
+                for name, group in quality_blocks:
+                    dist = group['dist_delta'].sum()
+                    if dist > 200: # Ignora picos curtos de menos de 200m
+                        steady_group = group[group['block_duration'] > STEADY_STATE_TRIM_S]
+                        if not steady_group.empty:
+                            avg_eff = steady_group['idx_karvonen'].mean()
+                        else:
+                            avg_eff = group['idx_karvonen'].mean()
+                        splits.append({'km': block_num, 'avg_eff': avg_eff, 'x_pos': group['distance'].iloc[-1]})
+                        block_num += 1
+                
+                # Resumo
                 data_treino = df['time'].min()
                 distancia_total = df['distance'].max() / 1000
                 tempo_total_min = df['elapsed_time'].max() / 60
@@ -103,39 +125,32 @@ if arquivos_tcx:
                     'FC Média': round(fc_media, 0),
                     'Eficiência': f"{saldo_global:+.1f}%",
                     'df': df,
-                    'saldo_num': saldo_global
+                    'splits': splits
                 })
             except Exception as e:
-                st.error(f"Erro ao processar {arquivo.name}: {e}")
+                st.error(f"Erro ao processar arquivo: {e}")
 
         if historico:
-            # Ordenar do treino mais antigo para o mais recente
             historico = sorted(historico, key=lambda x: x['Data Original'])
             
-            # 1. TABELA DE COMPARAÇÃO
             st.markdown("### 📅 Histórico de Treinos")
-            df_historico = pd.DataFrame(historico).drop(columns=['Data Original', 'df', 'saldo_num'])
+            df_historico = pd.DataFrame(historico).drop(columns=['Data Original', 'df', 'splits'])
             st.dataframe(df_historico, use_container_width=True, hide_index=True)
             
-            # 2. SELETOR DE TREINO PARA O GRÁFICO
             st.markdown("### 🔬 Análise Detalhada")
             opcoes_treino = [f"{h['Data']} - {h['Distância (km)']}km ({h['Eficiência']})" for h in historico]
-            
-            # O selectbox escolhe por padrão o último treino da lista (o mais recente)
             treino_selecionado = st.selectbox("Escolha um treino para gerar o gráfico Karvonen:", opcoes_treino, index=len(opcoes_treino)-1)
             
             idx_selecionado = opcoes_treino.index(treino_selecionado)
             treino_dados = historico[idx_selecionado]
             df_plot = treino_dados['df']
             
-            # 3. MÉTRICAS RÁPIDAS
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Distância", f"{treino_dados['Distância (km)']} km")
             col2.metric("Tempo", f"{int(df_plot['elapsed_time'].max() / 60)} min")
             col3.metric("FC Média", f"{treino_dados['FC Média']} bpm")
             col4.metric("Karvonen", treino_dados['Eficiência'], delta=treino_dados['Eficiência'], delta_color="normal")
             
-            # 4. GRÁFICO PRINCIPAL
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
             x_axis = df_plot['distance'] / 1000
             
@@ -151,9 +166,21 @@ if arquivos_tcx:
             ax2.fill_between(x_axis, y_axis, 0, where=(y_axis >= 0), color='green', alpha=0.3, interpolate=True)
             ax2.fill_between(x_axis, y_axis, 0, where=(y_axis < 0), color='red', alpha=0.3, interpolate=True)
             ax2.axhline(0, color='black', linestyle='--')
+            
+            # --- PLOTAGEM DOS PONTOS (TIROS) ---
+            for split in treino_dados['splits']:
+                color = 'green' if split['avg_eff'] >= 0 else 'red'
+                ax2.plot(split['x_pos']/1000, split['avg_eff'], marker='o', color=color, markersize=8, markeredgecolor='black')
+                y_offset = 12 if split['avg_eff'] >= 0 else -18
+                ax2.annotate(f"T{split['km']}\n{split['avg_eff']*100:+.1f}%", 
+                             (split['x_pos']/1000, split['avg_eff']),
+                             xytext=(0, y_offset), textcoords='offset points',
+                             ha='center', fontsize=9, fontweight='bold', color=color)
+            
             ax2.set_ylabel('Eficiência Real', fontweight='bold')
             ax2.set_xlabel('Distância (km)')
             ax2.grid(True, linestyle='--', alpha=0.3)
+            # Retirado o limite fixo do eixo Y para a linha não sumir em treinos muito intensos
             
             plt.tight_layout()
             st.pyplot(fig)
